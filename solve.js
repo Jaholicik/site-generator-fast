@@ -8,6 +8,8 @@
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESC_RE = /[&<>"']/;
 const ESC_RE2 = /[&<>"']/g;
+/** The characters that can open an inline construct: backslash, backtick, star, [. */
+const SPECIAL_RE = /[\\`*\[]/g;
 
 /** `text` with & < > " and ' escaped (the reference's table, applied to a whole run at once). */
 function escapeHtml(text) {
@@ -47,21 +49,39 @@ function slugifyRaw(text) {
     }
   }
   if (!ascii) return slugifySlow(text);
+  // Runs of [a-z0-9] are copied as one slice; an [A-Z] is one lowercased char; anything else is a gap.
   let out = '';
   let gap = false;
+  let runStart = -1;
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
-    let keep = null;
-    if (code >= 65 && code <= 90) keep = String.fromCharCode(code + 32);
-    else if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) keep = text[i];
-    if (keep === null) {
+    if ((code >= 97 && code <= 122) || (code >= 48 && code <= 57)) {
+      if (runStart === -1) {
+        if (gap) {
+          out += '-';
+          gap = false;
+        }
+        runStart = i;
+      }
+    } else if (code >= 65 && code <= 90) {
+      if (runStart !== -1) {
+        out += text.slice(runStart, i);
+        runStart = -1;
+      }
+      if (gap) {
+        out += '-';
+        gap = false;
+      }
+      out += String.fromCharCode(code + 32);
+    } else {
+      if (runStart !== -1) {
+        out += text.slice(runStart, i);
+        runStart = -1;
+      }
       gap = out.length > 0;
-      continue;
     }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
   }
+  if (runStart !== -1) out += text.slice(runStart);
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
 }
@@ -161,18 +181,25 @@ const isBlankLine = (line) => {
 
 /** A source's front matter and body: { data, body }, or { error } with the first reason it is refused. */
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
+  const firstNl = text.indexOf('\n');
+  if ((firstNl === -1 ? text : text.slice(0, firstNl)) !== '---') return { error: 'no front matter' };
+  const lines = [];
+  let body = null;
+  let pos = firstNl === -1 ? text.length : firstNl + 1;
+  while (pos <= text.length) {
+    const nl = text.indexOf('\n', pos);
+    const line = nl === -1 ? text.slice(pos) : text.slice(pos, nl);
+    if (line === '---') {
+      body = nl === -1 ? '' : text.slice(nl + 1);
       break;
     }
+    lines.push(line);
+    if (nl === -1) break;
+    pos = nl + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (body === null) return { error: 'the front matter is not closed' };
   const data = {};
-  for (let i = 1; i < close; i++) {
+  for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (isBlankLine(line) || line.startsWith('#')) continue;
     // /^([a-z_]+):(?: (.*))?$/ by hand: a run of [a-z_], a colon, then end of line or one space and the rest.
@@ -192,7 +219,7 @@ function parseFrontMatter(text) {
         raw0 = line.slice(p + 2);
       }
     }
-    if (key === null) return { error: `line ${i + 1} is not "key: value"` };
+    if (key === null) return { error: `line ${i + 2} is not "key: value"` };
     const raw = raw0.replace(/[ \t]+$/, '');
     if (!KEYS.has(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
@@ -202,7 +229,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body };
 }
 
 // ---------------------------------------------------------------- markdown
@@ -361,32 +388,34 @@ function findSingleStarScan(s, from, hi) {
   return -1;
 }
 
+/** findUnescaped when the range holds no backslash: a plain indexOf, bounded by `end`. */
+function findUnescapedFast(str, what, from, end) {
+  const j = str.indexOf(what, from);
+  return j !== -1 && j + what.length <= end ? j : -1;
+}
+
+/** findSingleStar when the range holds no backslash: indexOf jumps over ** pairs. */
+function findSingleStarFast(str, from, end) {
+  let j = str.indexOf('*', from);
+  while (j !== -1 && j < end) {
+    if (j + 1 >= end || str[j + 1] !== '*') return j;
+    j = str.indexOf('*', j + 2);
+  }
+  return -1;
+}
+
 /** The range s[lo, hi) rendered inline; `env.link(target)` is a link's href. Ranges, not slices: no copies. */
 function inlineRange(s, lo, hi, env) {
   // Whether a backslash occurs in the range decides the finders: indexOf jumps, or the escape-aware scans.
   const bsAt = s.indexOf('\\', lo);
   const hasBs = bsAt !== -1 && bsAt < hi;
-  const findUnescaped = hasBs
-    ? findUnescapedScan
-    : (str, what, from, end) => {
-        const j = str.indexOf(what, from);
-        return j !== -1 && j + what.length <= end ? j : -1;
-      };
-  const findSingleStar = hasBs
-    ? findSingleStarScan
-    : (str, from, end) => {
-        let j = str.indexOf('*', from);
-        while (j !== -1 && j < end) {
-          if (j + 1 >= end || str[j + 1] !== '*') return j;
-          j = str.indexOf('*', j + 2);
-        }
-        return -1;
-      };
+  const findUnescaped = hasBs ? findUnescapedScan : findUnescapedFast;
+  const findSingleStar = hasBs ? findSingleStarScan : findSingleStarFast;
   let out = '';
   let i = lo;
   while (i < hi) {
-    const c = s[i];
-    if (c === '\\') {
+    const c = s.charCodeAt(i);
+    if (c === 92) {
       if (i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
         const nx = s[i + 1];
         out += nx === '>' ? '&gt;' : nx;
@@ -397,7 +426,7 @@ function inlineRange(s, lo, hi, env) {
       }
       continue;
     }
-    if (c === '`') {
+    if (c === 96) {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1 && j < hi) {
         out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
@@ -408,7 +437,7 @@ function inlineRange(s, lo, hi, env) {
       }
       continue;
     }
-    if (c === '*') {
+    if (c === 42) {
       if (i + 1 < hi && s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2, hi);
         if (j > i + 2) {
@@ -430,7 +459,7 @@ function inlineRange(s, lo, hi, env) {
       }
       continue;
     }
-    if (c === '[') {
+    if (c === 91) {
       const k = findUnescaped(s, ']', i + 1, hi);
       const m = k !== -1 && k + 1 < hi && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 || m >= hi ? '' : s.slice(k + 2, m);
@@ -444,12 +473,9 @@ function inlineRange(s, lo, hi, env) {
       continue;
     }
     // A plain run: everything up to the next character that can open a construct, escaped in one pass.
-    let j = i + 1;
-    while (j < hi) {
-      const d = s[j];
-      if (d === '\\' || d === '`' || d === '*' || d === '[') break;
-      j++;
-    }
+    SPECIAL_RE.lastIndex = i + 1;
+    const sm = SPECIAL_RE.exec(s);
+    const j = sm === null || sm.index >= hi ? hi : sm.index;
     out += escapeHtml(s.slice(i, j));
     i = j;
   }
@@ -635,6 +661,12 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+// Scratch objects for one loop's scope, pooled: rendering is synchronous, so a loop's vars, loop record and
+// scope wrapper are dead the moment the loop ends; reusing them (fields fully reset on release) changes no result.
+const scopePool = [];
+const varsPool = [];
+const loopPool = [];
+
 /** `nodes` rendered in `scope` into `parts`; `templates` maps names to parsed nodes, a template that did not parse absent. */
 function renderNodes(nodes, scope, templates, depth, parts) {
   for (let idx = 0; idx < nodes.length; idx++) {
@@ -659,10 +691,25 @@ function renderNodes(nodes, scope, templates, depth, parts) {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
         const len = xs.length;
+        const vars = varsPool.pop() ?? {};
+        const loop = loopPool.pop() ?? {};
+        const child = scopePool.pop() ?? { vars: null, parent: null };
+        child.vars = vars;
+        child.parent = scope;
+        loop.length = len;
         for (let k = 0; k < len; k++) {
-          const vars = { [n.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
-          renderNodes(n.body, { vars, parent: scope }, templates, depth, parts);
+          vars[n.name] = xs[k];
+          vars.loop = loop;
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === len - 1;
+          renderNodes(n.body, child, templates, depth, parts);
         }
+        delete vars[n.name];
+        delete vars.loop;
+        varsPool.push(vars);
+        loopPool.push(loop);
+        scopePool.push(child);
         break;
       }
       case 'include': {
@@ -695,7 +742,22 @@ function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    const code = text.charCodeAt(i);
+    if (code > 32) {
+      if (code < 8192) {
+        if (code === 160 || code === 5760) {
+          inWord = false;
+          continue;
+        }
+      } else if (isWsCode(code)) {
+        inWord = false;
+        continue;
+      }
+      if (!inWord) {
+        inWord = true;
+        n++;
+      }
+    } else if (code === 32 || (code >= 9 && code <= 13)) inWord = false;
     else if (!inWord) {
       inWord = true;
       n++;
@@ -704,18 +766,29 @@ function wordsOf(text) {
   return n;
 }
 
+/** Whether `rel` has no empty, '.' or '..' segment (so resolving it is the plain join), by substring scans. */
+function isSimpleRel(rel) {
+  return (
+    rel !== '' &&
+    !rel.startsWith('/') &&
+    !rel.endsWith('/') &&
+    !rel.startsWith('./') &&
+    !rel.startsWith('../') &&
+    !rel.endsWith('/.') &&
+    !rel.endsWith('/..') &&
+    rel !== '.' &&
+    rel !== '..' &&
+    !rel.includes('//') &&
+    !rel.includes('/./') &&
+    !rel.includes('/../')
+  );
+}
+
 /** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
 function resolvePathRaw(dir, rel) {
-  const segs = rel.split('/');
   // The common shape: no empty, '.' or '..' segment, so the answer is the plain join.
-  let simple = true;
-  for (const seg of segs) {
-    if (seg === '' || seg === '.' || seg === '..') {
-      simple = false;
-      break;
-    }
-  }
-  if (simple) return dir === '' ? rel : `${dir}/${rel}`;
+  if (isSimpleRel(rel)) return dir === '' ? rel : `${dir}/${rel}`;
+  const segs = rel.split('/');
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of segs) {
     if (seg === '' || seg === '.') continue;
@@ -912,7 +985,7 @@ export function build(input) {
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
     reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    tags: s.tagRefs.map((t) => t.view ?? (t.view = { name: t.name, slug: t.slug, url: t.url })),
   });
   const pageOf = (s) => ({
     ...cardOfOnce(s),
@@ -939,12 +1012,19 @@ export function build(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
+  const rootVars = { site, tags: allTags, recent };
+  const rootScope = { vars: rootVars, parent: null };
+  const renderParts = [];
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
-    const parts = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, templates, 0, parts);
-    return parts.join('');
+    const keys = Object.keys(vars);
+    for (const k of keys) rootVars[k] = vars[k];
+    renderParts.length = 0;
+    renderNodes(nodes, rootScope, templates, 0, renderParts);
+    const out = renderParts.join('');
+    for (const k of keys) delete rootVars[k];
+    return out;
   };
   for (const s of sources) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = input.site.per_page;
